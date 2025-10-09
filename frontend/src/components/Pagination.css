@@ -1,0 +1,64 @@
+/* frontend/src/components/Pagination.css */
+
+.pagination-nav {
+  display: flex;
+  justify-content: center;
+  margin-top: 20px;
+}
+
+.pagination {
+  display: flex;
+  list-style: none;
+  padding: 0;
+  border: 1px solid #4b525d;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: #33373e;
+}
+
+.page-item {
+  border-right: 1px solid #4b525d;
+}
+
+.page-item:last-child {
+  border-right: none;
+}
+
+.page-link {
+  color: #abb2bf;
+  text-decoration: none;
+  padding: 12px 18px;
+  display: block;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.page-link:hover {
+  background-color: #4b525d;
+}
+
+.page-item.active .page-link {
+  background-color: #61afef;
+  color: white;
+  border-color: #61afef;
+}
+
+.page-item.disabled .page-link {
+  color: #5c6370;
+  cursor: not-allowed;
+  background-color: #33373e;
+}
+
+.page-item.ellipsis .page-link {
+  cursor: default;
+  background-color: #33373e;
+}
+
+.page-item.ellipsis .page-link:hover {
+  background-color: #33373e;
+}
+
+/* Specific styling for Previous/Next buttons */
+.page-item:first-child .page-link,
+.page-item:last-child .page-link {
+  font-weight: bold;
+}

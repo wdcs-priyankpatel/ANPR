@@ -1,0 +1,111 @@
+/* frontend/src/components/CameraSelector.css */
+
+.camera-selector {
+  position: relative;
+  display: inline-block;
+  z-index: 20;
+}
+
+.dropdown-toggle {
+  background-color: #282c34;
+  color: #abb2bf;
+  border: 1px solid #4b525d;
+  padding: 12px 18px;
+  border-radius: 8px;
+  font-size: 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 250px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.dropdown-toggle:hover {
+  border-color: #61afef;
+  box-shadow: 0 0 0 2px rgba(97, 175, 239, 0.2);
+}
+
+.dropdown-arrow {
+  margin-left: 10px;
+}
+
+.dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 5px;
+  background-color: #33373e;
+  border: 1px solid #4b525d;
+  border-radius: 8px;
+  list-style: none;
+  padding: 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.dropdown-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  border-bottom: 1px solid #4b525d;
+}
+
+.dropdown-item:last-child {
+  border-bottom: none;
+}
+
+.dropdown-item:hover {
+  background-color: #4b525d;
+}
+
+.camera-info-link {
+  flex-grow: 1;
+  color: #c678dd;
+  font-weight: bold;
+}
+
+.camera-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.edit-button,
+.detection-button {
+  padding: 5px 10px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+  transition: background-color 0.2s;
+}
+
+.edit-button {
+  background-color: #61afef;
+  color: white;
+}
+
+.edit-button:hover {
+  background-color: #528ecc;
+}
+
+.detection-button.stopped {
+  background-color: #98c379;
+  color: white;
+}
+
+.detection-button.stopped:hover {
+  background-color: #84b36c;
+}
+
+.detection-button.running {
+  background-color: #e06c75;
+  color: white;
+}
+
+.detection-button.running:hover {
+  background-color: #c95c64;
+}

@@ -1,0 +1,58 @@
+/* frontend/src/components/NumberPlateTable.css */
+
+.table-container {
+  overflow-x: auto;
+  margin-top: 20px;
+  background-color: #3e4452; /* Darker background for the table area */
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+th, td {
+  border: 1px solid #4b525d; /* Darker border */
+  padding: 15px;
+  text-align: left;
+  color: #abb2bf;
+}
+
+th {
+  background-color: #282c34; /* Dark background for table headers */
+  color: #61afef; /* Blue text for headers */
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+tr:nth-child(even) {
+  background-color: #3a4049; /* Slightly different shade for even rows */
+}
+
+tr:hover {
+  background-color: #4b525d; /* Lighter on hover for rows */
+  cursor: pointer;
+}
+
+td:last-child {
+  color: #98c379; /* Green accent for "View Image" action */
+  font-weight: bold;
+}
+
+/* NEW: Status specific styling */
+.status-in {
+  font-weight: bold;
+  color: #98c379; /* Green for IN */
+  background-color: rgba(152, 195, 121, 0.1);
+  text-align: center;
+}
+
+.status-out {
+  font-weight: bold;
+  color: #e06c75; /* Red for OUT */
+  background-color: rgba(224, 108, 117, 0.1);
+  text-align: center;
+}
