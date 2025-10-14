@@ -11,10 +11,11 @@ import re
 from .sort.sort import Sort
 import csv
 from collections import deque
-from datetime import datetime, timedelta # Removed timezone
+from datetime import datetime, timedelta
 import atexit
 from .database import SessionLocal
-from . import crud
+from . import crud, models
+from sqlalchemy import desc
 import subprocess
 import threading
 from queue import Queue, Empty
@@ -28,7 +29,7 @@ try:
     ocr = PaddleOCR(use_angle_cls=True, lang='en')
     mot_tracker = Sort()
     # Ensure this path is correct relative to where the worker executes
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '/home/admin2/priyank/01_number_plate/backend/app/best.pt')
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best.pt')
     model = YOLO(model_path, task="detect")
 except Exception as e:
     print(f"Error initializing models in anpr_worker: {e}")
@@ -379,7 +380,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
     most_freq = get_most_frequent_text_from_best_detections(active_tracks[track_id])
     best_detection = get_best_detection_for_track(active_tracks[track_id])
     
-    # 1. Use datetime.datetime.now() to get a naive datetime object (per user request)
+    # 1. Use datetime.datetime.now() to get a naive datetime object
     timestamp = datetime.now()
     
     if most_freq and best_detection:
@@ -387,44 +388,13 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         # 2. Check for overall cooldown to prevent over-logging (5 minute check)
         db = SessionLocal()
         try:
-            # NOTE: crud.is_plate_recently_detected must be compatible with naive datetimes
             if crud.is_plate_recently_detected(db, most_freq, camera_name, 5): 
                  print(f"⏭️ Skipping {most_freq}, recently detected (within 5 min cooldown)")
                  return
         finally:
             db.close()
 
-        # Re-initialize DB session for final save operation
-        db = SessionLocal()
-        
-        # 3. Save to database and determine IN/OUT status
-        plate_data_for_db = {
-            "camera_name": camera_name,
-            "plate_number": most_freq,
-            "image_path": "", # Placeholder, path determined after saving
-            "created_at": timestamp 
-        }
-
-        db_plate = None
-        try:
-            # Call the new processing function
-            # NOTE: crud.process_detection_event must now handle a naive datetime object
-            db_plate = crud.process_detection_event(db, plate_data_for_db)
-            
-            # If the crud function returns None, it means the event was skipped (gap < 1 min)
-            if db_plate is None:
-                 print(f"⏭️ Skipping {most_freq}, too soon for IN/OUT event.")
-                 return
-
-        except Exception as e:
-            print(f"❌ Database error during IN/OUT processing: {e}")
-            return
-        finally:
-            db.close()
-
-        # --- File Saving (Only proceeds if a DB entry was successfully created) ---
-        
-        # Determine paths based on timestamp
+        # --- DETERMINE PATHS FIRST (Before DB operations) ---
         date_str = timestamp.strftime('%Y-%m-%d')
         save_path_date = os.path.join(MAIN_SAVE_DIR, date_str)
         save_path_photo = os.path.join(save_path_date, 'photo')
@@ -435,25 +405,69 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         os.makedirs(save_path_video, exist_ok=True)
         os.makedirs(save_path_csv, exist_ok=True)
 
-        # Save photo (Adding status to filename)
-        photo_name = f"{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}_{most_freq}_{db_plate.status}.jpg"
+        # --- DETERMINE STATUS BEFORE SAVING FILES ---
+        db = SessionLocal()
+        predicted_status = "IN"  # Default status
+        try:
+            # Get the last detection to determine what the new status WOULD be
+            last_detection = db.query(models.NumberPlate).filter(
+                models.NumberPlate.plate_number == most_freq,
+                models.NumberPlate.camera_name == camera_name
+            ).order_by(desc(models.NumberPlate.created_at)).first()
+            
+            if last_detection:
+                time_since_last = timestamp - last_detection.created_at
+                if time_since_last.total_seconds() > 60:
+                    # If the last event was 'IN', the new event is 'OUT'
+                    predicted_status = "OUT" if last_detection.status == "IN" else "IN"
+                else:
+                    # Too soon, skip this detection
+                    print(f"⏭️ Skipping {most_freq}, too soon for IN/OUT event.")
+                    return
+        finally:
+            db.close()
+
+        # --- SAVE PHOTO WITH CORRECT STATUS IN FILENAME ---
+        photo_name = f"{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}_{most_freq}_{predicted_status}.jpg"
         photo_path = os.path.join(save_path_photo, photo_name)
         cv2.imwrite(photo_path, best_detection['cropped_image'])
         
-        # Get relative path for database update
+        # Get relative path for database
         image_path_relative = os.path.join(date_str, 'photo', photo_name)
-        
-        # Update image path in the database record we just created
+
+        # --- CREATE DB ENTRY WITH CORRECT IMAGE PATH ---
         db = SessionLocal()
+        db_plate = None
         try:
-            db_plate.image_path = image_path_relative
-            db.commit()
+            # Create the plate data with the correct image path
+            plate_data_for_db = {
+                "camera_name": camera_name,
+                "plate_number": most_freq,
+                "image_path": image_path_relative,  # ← Image path included from start
+                "created_at": timestamp 
+            }
+
+            # Process detection event (this will create the DB entry)
+            db_plate = crud.process_detection_event(db, plate_data_for_db)
+            
+            if db_plate is None:
+                # This shouldn't happen now since we checked above, but safety check
+                print(f"⏭️ Detection was skipped by process_detection_event.")
+                # Remove the photo we just saved since we're not logging this
+                if os.path.exists(photo_path):
+                    os.remove(photo_path)
+                return
+
         except Exception as e:
-            print(f"❌ Failed to update image path in DB: {e}")
+            print(f"❌ Database error during IN/OUT processing: {e}")
+            # Remove the photo we just saved since DB save failed
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+            return
         finally:
             db.close()
-            
-        # IMPROVED VIDEO SAVING
+
+        # --- SAVE VIDEO ---
         video_name = f"{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}_{most_freq}_{db_plate.status}.mp4"
         video_path = os.path.join(save_path_video, video_name)
         
@@ -552,7 +566,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
             except Exception as e:
                 print(f"❌ Video saving error: {e}")
 
-        # Save CSV (Adding status to CSV data)
+        # --- SAVE CSV ---
         csv_path = os.path.join(save_path_csv, f"{camera_name}_{date_str}.csv")
         csv_data = {
             'Timestamp': timestamp.strftime('%Y-%m-%d_%H-%M-%S'), 
@@ -564,7 +578,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         }
         save_data_to_csv(csv_path, csv_data)
         
-        # Update JSON (Adding status to JSON data)
+        # --- UPDATE JSON ---
         full_json_path = os.path.join(BASE_DIR, "../results_json", f"{camera_name}.json")
         try:
             with open(full_json_path, 'r') as f:
@@ -584,6 +598,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
             json.dump(current_data, f, indent=4)
         
         print(f"💾 Saved detection: {most_freq} ({db_plate.status}) -> {date_str}/")
+        print(f"📸 Image path saved: {image_path_relative}")
         processed_detections[track_id] = True
 
 def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, camera_id):
