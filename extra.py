@@ -52,10 +52,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_SAVE_DIR = os.path.join(BASE_DIR, "../detected_data")
 STATUS_DIR = os.path.join(BASE_DIR, "../status")
 VIDEO_FPS = 20
-BUFFER_SIZE = int(VIDEO_FPS * 30)
-
-# IMPROVEMENT 4: Minimum tracking duration
-MIN_FRAMES_TO_SAVE = 15  # Require at least 15 frames before saving
+BUFFER_SIZE = int(VIDEO_FPS * 30)  # 30 seconds buffer
+VIDEO_RECORD_DURATION = 20  # 20 seconds video after first detection
 
 os.makedirs(STATUS_DIR, exist_ok=True)
 
@@ -302,73 +300,15 @@ def read_coordinates_from_string(coordinates_string):
         print(f"Error parsing coordinates: {e}. Using default coordinates.")
         return (100, 100), (300, 200)
 
-# IMPROVEMENT 2: Track consolidation functions
-def calculate_iou(box1, box2):
-    """Calculate Intersection over Union between two boxes"""
-    x1_1, y1_1, x2_1, y2_1 = box1
-    x1_2, y1_2, x2_2, y2_2 = box2
+def is_vehicle_in_zone(bbox, zone_coords):
+    """Check if vehicle bounding box intersects with detection zone"""
+    x1, y1, x2, y2 = bbox
+    x_min, y_min, x_max, y_max = zone_coords
     
-    # Calculate intersection
-    x1_i = max(x1_1, x1_2)
-    y1_i = max(y1_1, y1_2)
-    x2_i = min(x2_1, x2_2)
-    y2_i = min(y2_1, y2_2)
-    
-    if x2_i < x1_i or y2_i < y1_i:
-        return 0.0
-    
-    intersection = (x2_i - x1_i) * (y2_i - y1_i)
-    
-    # Calculate union
-    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union = area1 + area2 - intersection
-    
-    return intersection / union if union > 0 else 0.0
-
-def consolidate_duplicate_tracks(active_tracks, tracked_vehicles_details, iou_threshold=0.6):
-    """Merge tracks that likely represent the same vehicle"""
-    
-    track_ids = list(tracked_vehicles_details.keys())
-    merged_tracks = {}
-    
-    for i, track_id_1 in enumerate(track_ids):
-        if track_id_1 in merged_tracks:
-            continue
-            
-        box1 = tracked_vehicles_details[track_id_1]['box']
-        type1 = tracked_vehicles_details[track_id_1]['type']
-        
-        # Check against all other tracks
-        for track_id_2 in track_ids[i+1:]:
-            if track_id_2 in merged_tracks:
-                continue
-                
-            box2 = tracked_vehicles_details[track_id_2]['box']
-            type2 = tracked_vehicles_details[track_id_2]['type']
-            
-            # Only merge same vehicle types
-            if type1 != type2:
-                continue
-            
-            # Calculate IoU
-            iou = calculate_iou(box1, box2)
-            
-            if iou > iou_threshold:
-                # Merge track_id_2 into track_id_1
-                merged_tracks[track_id_2] = track_id_1
-                print(f"🔄 Merging duplicate track {track_id_2} into {track_id_1} (IoU: {iou:.2f})")
-                
-                # Merge plate data if exists
-                if track_id_2 in active_tracks and track_id_1 in active_tracks:
-                    active_tracks[track_id_1]['plates'].extend(active_tracks[track_id_2]['plates'])
-                    # Update frame count to the maximum
-                    active_tracks[track_id_1]['frames_tracked'] = max(
-                        active_tracks[track_id_1].get('frames_tracked', 0),
-                        active_tracks[track_id_2].get('frames_tracked', 0)
-                    )
-    
-    return merged_tracks
+    # Check if there's any overlap
+    if x2 >= x_min and x1 <= x_max and y2 >= y_min and y1 <= y_max:
+        return True
+    return False
 
 def get_best_detection_for_track(ocr_results_list):
     if not ocr_results_list:
@@ -421,7 +361,7 @@ def get_most_frequent_text_from_best_detections(ocr_results_list):
         return unique[index]
 
 def save_data_to_csv(csv_path, plate_data):
-    headers = ['Timestamp', 'PlateNumber', 'VehicleType', 'DetectionScore', 'OcrConfidence', 'CombinedScore', 'Status']
+    headers = ['Timestamp', 'PlateNumber', 'VehicleType', 'DetectionScore', 'OcrConfidence', 'CombinedScore', 'Status', 'TrackID']
     file_exists = os.path.exists(csv_path)
     with open(csv_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -429,8 +369,154 @@ def save_data_to_csv(csv_path, plate_data):
             writer.writeheader()
         writer.writerow(plate_data)
 
-def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_width, frame_height, frame_buffer, current_frame_for_full_img):
-    """Process and save detection results, logging all tracked vehicles (with or without a plate)."""
+def draw_detection_zone(frame, zone_coords):
+    """Draw blue detection zone rectangle on frame"""
+    x_min, y_min, x_max, y_max = zone_coords
+    # Draw blue rectangle (BGR: Blue=255, Green=0, Red=0)
+    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 3)
+    # Add label
+    cv2.putText(frame, "DETECTION ZONE", (x_min, y_min - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    return frame
+
+def draw_vehicle_detection(frame, bbox, vehicle_type, track_id, plate_text="", detection_score=0.0):
+    """Draw yellow bounding box with detection info"""
+    x1, y1, x2, y2 = [int(i) for i in bbox]
+    
+    # Draw yellow rectangle (BGR: Blue=0, Green=255, Red=255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    
+    # Prepare text
+    label_text = f"ID:{track_id} | {vehicle_type.upper()}"
+    if plate_text:
+        label_text += f" | {plate_text}"
+    label_text += f" | {detection_score:.2f}"
+    
+    # Calculate text size for background
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(label_text, font, font_scale, thickness)
+    
+    # Draw black background for text
+    cv2.rectangle(frame, (x1, y1 - text_height - baseline - 5), 
+                  (x1 + text_width, y1), (0, 0, 0), -1)
+    
+    # Draw text
+    cv2.putText(frame, label_text, (x1, y1 - baseline - 5), 
+                font, font_scale, (0, 255, 255), thickness)
+    
+    return frame
+
+def save_video_with_annotations(video_frames, video_path, fps, width, height, zone_coords, track_info):
+    """Save video with detection zone and vehicle annotations"""
+    try:
+        if not video_frames or len(video_frames) == 0:
+            print("❌ No frames to save")
+            return False
+        
+        # Prepare codec options
+        codecs_to_try = [
+            ('mp4v', '.mp4'),
+            ('XVID', '.avi'),
+            ('X264', '.mp4'),
+            ('MJPG', '.avi'),
+        ]
+        
+        video_writer = None
+        final_video_path = None
+        
+        for codec, ext in codecs_to_try:
+            try:
+                temp_video_path = video_path.replace('.mp4', ext)
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                actual_fps = max(5, min(fps, 30))
+                
+                video_writer = cv2.VideoWriter(
+                    temp_video_path, 
+                    fourcc, 
+                    actual_fps, 
+                    (width, height)
+                )
+                
+                if video_writer.isOpened():
+                    final_video_path = temp_video_path
+                    print(f"✅ Video writer initialized with {codec} codec")
+                    break
+                else:
+                    if video_writer: 
+                        video_writer.release()
+                    video_writer = None
+                    
+            except Exception as e:
+                print(f"❌ Failed to initialize {codec} codec: {e}")
+                if video_writer: 
+                    video_writer.release()
+                video_writer = None
+        
+        if not video_writer or not video_writer.isOpened():
+            print("❌ Could not initialize any video codec")
+            return False
+        
+        frames_written = 0
+        for frame in video_frames:
+            try:
+                if frame is None or frame.size == 0:
+                    continue
+                
+                # Resize if needed
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(frame, (width, height))
+                
+                # Annotate frame
+                annotated_frame = frame.copy()
+                
+                # Draw detection zone (blue)
+                annotated_frame = draw_detection_zone(annotated_frame, zone_coords)
+                
+                # Draw vehicle detection (yellow)
+                if track_info:
+                    annotated_frame = draw_vehicle_detection(
+                        annotated_frame,
+                        track_info['vehicle_bbox'],
+                        track_info['vehicle_type'],
+                        track_info['track_id'],
+                        track_info.get('plate_text', ''),
+                        track_info.get('detection_score', 0.0)
+                    )
+                
+                video_writer.write(annotated_frame)
+                frames_written += 1
+                
+            except Exception as e:
+                print(f"Error writing frame: {e}")
+                continue
+        
+        video_writer.release()
+        
+        if os.path.exists(final_video_path):
+            file_size = os.path.getsize(final_video_path)
+            if file_size > 1000:
+                print(f"✅ Video saved: {final_video_path} ({file_size} bytes, {frames_written} frames)")
+                return True
+            else:
+                print(f"⚠️ Video file too small: {file_size} bytes")
+                try:
+                    os.remove(final_video_path)
+                except:
+                    pass
+                return False
+        else:
+            print("❌ Video file was not created")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Video saving error: {e}")
+        return False
+
+def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_width, frame_height, 
+                                video_frames, current_frame_for_full_img, zone_coords):
+    """Process and save detection results with 20-second video recording."""
     global processed_detections
     
     if track_id not in active_tracks:
@@ -438,17 +524,12 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
 
     track_data = active_tracks[track_id]
     
-    # IMPROVEMENT 4: Check minimum tracking duration
-    frames_tracked = track_data.get('frames_tracked', 0)
-    if frames_tracked < MIN_FRAMES_TO_SAVE:
-        print(f"⏭️ Skipping track {track_id}, only tracked for {frames_tracked} frames (minimum: {MIN_FRAMES_TO_SAVE})")
-        return
-    
     # 1. Get plate and vehicle data
     most_freq = get_most_frequent_text_from_best_detections(track_data['plates'])
     best_plate_detection = get_best_detection_for_track(track_data['plates'])
     vehicle_type = track_data['vehicle_type']
     vehicle_bbox = track_data['vehicle_bbox']
+    detection_score = track_data.get('detection_score', 0.0)
     
     plate_tag = most_freq if most_freq else "NOPLATE"
     log_type = f"{'PLATE & ' if most_freq else ''}{vehicle_type.upper()}"
@@ -504,14 +585,24 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         finally:
             db.close()
 
-    # --- SAVE FULL FRAME IMAGE ---
-    full_frame_name = f"{time_str}_{plate_tag}_{vehicle_type.upper()}_{predicted_status}.jpg"
+    # --- SAVE FULL FRAME IMAGE WITH ANNOTATIONS ---
+    full_frame_name = f"{time_str}_ID{track_id}_{plate_tag}_{vehicle_type.upper()}_{predicted_status}.jpg"
     full_frame_path = os.path.join(save_path_full_frame, full_frame_name)
     
-    v_x1, v_y1, v_x2, v_y2 = [int(i) for i in vehicle_bbox]
-    frame_to_save = current_frame_for_full_img.copy() 
-    cv2.rectangle(frame_to_save, (v_x1, v_y1), (v_x2, v_y2), (0, 255, 0), 2)
-    cv2.putText(frame_to_save, f"{vehicle_type.upper()} ({plate_tag})", (v_x1, v_y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    frame_to_save = current_frame_for_full_img.copy()
+    
+    # Draw detection zone (blue)
+    frame_to_save = draw_detection_zone(frame_to_save, zone_coords)
+    
+    # Draw vehicle detection (yellow)
+    frame_to_save = draw_vehicle_detection(
+        frame_to_save,
+        vehicle_bbox,
+        vehicle_type,
+        track_id,
+        plate_tag,
+        detection_score
+    )
     
     cv2.imwrite(full_frame_path, frame_to_save)
     full_image_path_relative = os.path.join(date_str, 'full_frame', full_frame_name)
@@ -519,7 +610,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
     # --- SAVE CROPPED PLATE PHOTO ---
     image_path_relative = None
     if best_plate_detection:
-        photo_name = f"{time_str}_{most_freq}_{predicted_status}.jpg"
+        photo_name = f"{time_str}_ID{track_id}_{most_freq}_{predicted_status}.jpg"
         photo_path = os.path.join(save_path_photo, photo_name)
         cv2.imwrite(photo_path, best_plate_detection['cropped_image'])
         image_path_relative = os.path.join(date_str, 'plate_photo', photo_name)
@@ -555,95 +646,31 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
     finally:
         db.close()
 
-    # --- SAVE VIDEO ---
-    video_name = f"{time_str}_{plate_tag}_{vehicle_type.upper()}_{db_plate.status}.mp4"
+    # --- SAVE 20-SECOND VIDEO WITH ANNOTATIONS ---
+    video_name = f"{time_str}_ID{track_id}_{plate_tag}_{vehicle_type.upper()}_{db_plate.status}.mp4"
     video_path = os.path.join(save_path_video, video_name)
     
-    if frame_buffer and len(frame_buffer) > 0:
-        try:
-            actual_height, actual_width = None, None
-            valid_frames = []
-            
-            for frame in frame_buffer:
-                if frame is not None and frame.size > 0:
-                    if actual_height is None:
-                        actual_height, actual_width = frame.shape[:2]
-                    
-                    if actual_height and actual_width and frame.shape[:2] == (actual_height, actual_width):
-                        valid_frames.append(frame)
-                    elif actual_height and actual_width:
-                        resized_frame = cv2.resize(frame, (actual_width, actual_height))
-                        valid_frames.append(resized_frame)
-            
-            if valid_frames and actual_height and actual_width:
-                codecs_to_try = [
-                    ('mp4v', '.mp4'),
-                    ('XVID', '.avi'),
-                    ('X264', '.mp4'),
-                    ('MJPG', '.avi'),
-                ]
-                
-                video_writer = None
-                final_video_path = None
-                
-                for codec, ext in codecs_to_try:
-                    try:
-                        temp_video_path = video_path.replace('.mp4', ext)
-                        fourcc = cv2.VideoWriter_fourcc(*codec)
-                        actual_fps = max(5, min(fps, 30))
-                        
-                        video_writer = cv2.VideoWriter(
-                            temp_video_path, 
-                            fourcc, 
-                            actual_fps, 
-                            (actual_width, actual_height)
-                        )
-                        
-                        if video_writer.isOpened():
-                            final_video_path = temp_video_path
-                            print(f"✅ Video writer initialized with {codec} codec")
-                            break
-                        else:
-                            if video_writer: video_writer.release()
-                            video_writer = None
-                            
-                    except Exception as e:
-                        print(f"❌ Failed to initialize {codec} codec: {e}")
-                        if video_writer: video_writer.release()
-                        video_writer = None
-                
-                if video_writer and video_writer.isOpened():
-                    frames_written = 0
-                    for frame in valid_frames:
-                        try:
-                            video_writer.write(frame)
-                            frames_written += 1
-                        except Exception as e:
-                            print(f"Error writing frame: {e}")
-                            break
-                    
-                    video_writer.release()
-                    
-                    if os.path.exists(final_video_path):
-                        file_size = os.path.getsize(final_video_path)
-                        if file_size > 1000:
-                            print(f"✅ Video saved: {final_video_path} ({file_size} bytes, {frames_written} frames)")
-                        else:
-                            print(f"⚠️ Video file too small: {file_size} bytes")
-                            try:
-                                os.remove(final_video_path)
-                            except:
-                                pass
-                    else:
-                        print("❌ Video file was not created")
-                else:
-                    print("❌ Could not initialize any video codec")
-                    
-            else:
-                print("❌ No valid frames found in buffer")
-                
-        except Exception as e:
-            print(f"❌ Video saving error: {e}")
+    # Prepare track info for video annotations
+    track_info = {
+        'track_id': track_id,
+        'vehicle_type': vehicle_type,
+        'vehicle_bbox': vehicle_bbox,
+        'plate_text': plate_tag,
+        'detection_score': detection_score
+    }
+    
+    video_saved = save_video_with_annotations(
+        video_frames,
+        video_path,
+        fps,
+        frame_width,
+        frame_height,
+        zone_coords,
+        track_info
+    )
+    
+    if not video_saved:
+        print(f"⚠️ Warning: Video could not be saved for Track ID {track_id}")
 
     # --- SAVE CSV ---
     csv_path = os.path.join(save_path_csv, f"{camera_name}_{date_str}.csv")
@@ -651,10 +678,11 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         'Timestamp': timestamp.strftime('%Y-%m-%d_%H-%M-%S'),
         'PlateNumber': plate_tag,
         'VehicleType': vehicle_type,
-        'DetectionScore': round(best_plate_detection.get('detection_score', 0.0), 4) if best_plate_detection else 0.0,
+        'DetectionScore': round(detection_score, 4),
         'OcrConfidence': round(best_plate_detection.get('confidence', 0.0), 4) if best_plate_detection else 0.0,
         'CombinedScore': round(best_plate_detection.get('combined_score', 0.0), 4) if best_plate_detection else 0.0,
-        'Status': db_plate.status
+        'Status': db_plate.status,
+        'TrackID': track_id
     }
     save_data_to_csv(csv_path, csv_data)
     
@@ -666,29 +694,31 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
     except (FileNotFoundError, json.JSONDecodeError):
         current_data = {}
         
-    current_data[plate_tag] = {
+    current_data[f"{plate_tag}_ID{track_id}"] = {
+        "track_id": track_id,
         "detection_score": csv_data['DetectionScore'],
         "ocr_confidence": csv_data['OcrConfidence'],
         "combined_score": csv_data['CombinedScore'],
         "img_path": image_path_relative,
         "full_img_path": full_image_path_relative,
         "vehicle_type": vehicle_type,
-        "status": db_plate.status
+        "status": db_plate.status,
+        "timestamp": timestamp.isoformat()
     }
     
     with open(full_json_path, 'w') as f:
         json.dump(current_data, f, indent=4)
     
-    print(f"💾 Saved detection: {log_type} (Plate: {plate_tag}, Status: {db_plate.status}, Tracked: {frames_tracked} frames)")
+    print(f"💾 Saved detection: {log_type} (Track ID: {track_id}, Plate: {plate_tag}, Status: {db_plate.status})")
     processed_detections[track_id] = True
 
 def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, camera_id):
-    """Ubuntu-optimized ANPR worker with YOLOv8 built-in tracking (BoT-SORT/ByteTrack)."""
+    """Ubuntu-optimized ANPR worker with YOLOv8 built-in tracking and 20-second video recording."""
     atexit.register(cleanup_status_file, camera_id)
     
     frame_queue = Queue(maxsize=3)
     frame_reader = None
-    frame_buffer = deque(maxlen=BUFFER_SIZE)
+    frame_buffer = deque(maxlen=BUFFER_SIZE)  # 30-second buffer
     
     actual_fps = VIDEO_FPS
     actual_width = 1920
@@ -709,8 +739,10 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         rect_start, rect_end = read_coordinates_from_string(coordinates_string)
         x_min, y_min = min(rect_start[0], rect_end[0]), min(rect_start[1], rect_end[1])
         x_max, y_max = max(rect_start[0], rect_end[0]), max(rect_start[1], rect_end[1])
+        zone_coords = (x_min, y_min, x_max, y_max)
         
         print(f"🚀 Starting YOLO Tracking ANPR processing: {rtsp_link}")
+        print(f"📍 Detection Zone: ({x_min}, {y_min}) to ({x_max}, {y_max})")
         write_status(camera_id, "connecting")
         
         # Start threaded frame reader
@@ -742,14 +774,15 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         write_status(camera_id, "running")
         print(f"✅ Successfully connected to {rtsp_link}")
 
-        # Active tracks: {track_id: {'vehicle_type': str, 'vehicle_bbox': list, 'plates': [], 'frames_tracked': int}}
+        # Active tracks with video recording
         active_tracks = {}
         previous_track_ids = set()
         frame_count = 0
         last_stats = time.time()
         fps_start_time = time.time()
         
-        print("🎯 Using YOLOv8 Built-in Tracking (BoT-SORT) with improvements")
+        print("🎯 Using YOLOv8 Built-in Tracking (BoT-SORT)")
+        print(f"🎥 Recording {VIDEO_RECORD_DURATION} seconds after first detection")
         
         while frame_reader.running:
             try:
@@ -773,25 +806,21 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                 # Print stats every 30 seconds
                 if time.time() - last_stats > 30:
                     fps_display = frame_count / (time.time() - last_stats + 30)
-                    print(f"📊 Processing stats - Frames: {frame_count}, FPS: {fps_display:.1f}, Actual FPS: {actual_fps:.1f}, Active Tracks: {len(active_tracks)}")
+                    print(f"📊 Processing stats - Frames: {frame_count}, FPS: {fps_display:.1f}, "
+                          f"Actual FPS: {actual_fps:.1f}, Active Tracks: {len(active_tracks)}")
                     last_stats = time.time()
                     frame_count = 0
                 
-                current_frame_for_save = frame.copy() 
+                current_frame_for_save = frame.copy()
                 ocr_frame = frame.copy()
                 
-                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
-                
-                # --- 1. Vehicle Detection + Tracking (IMPROVEMENT 1: Enhanced tracker config) ---
+                # --- 1. Vehicle Detection + Tracking ---
                 vehicle_results = vehicle_model.track(
                     frame, 
                     persist=True,
                     tracker="botsort.yaml",
                     verbose=False,
-                    classes=list(VEHICLE_CLASSES.keys()),
-                    conf=0.3,      # Lower confidence for better continuity
-                    iou=0.5,       # IoU threshold for tracking
-                    max_det=20     # Limit max detections
+                    classes=list(VEHICLE_CLASSES.keys())
                 )
                 
                 tracked_vehicles_details = {}
@@ -807,33 +836,22 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                         cls_id_int = int(cls_id)
                         x1, y1, x2, y2 = box.astype(int)
                         
-                        # Check if vehicle is in detection zone
-                        if cls_id_int in VEHICLE_CLASSES and x2 >= x_min and x1 <= x_max and y2 >= y_min and y1 <= y_max:
-                            vehicle_type = VEHICLE_CLASSES.get(cls_id_int, "UNKNOWN")
+                        # **ONLY DETECT VEHICLES IN ZONE**
+                        if cls_id_int in VEHICLE_CLASSES:
+                            vehicle_bbox = [int(x1), int(y1), int(x2), int(y2)]
                             
-                            tracked_vehicles_details[track_id] = {
-                                'box': [int(x1), int(y1), int(x2), int(y2)],
-                                'type': vehicle_type,
-                                'confidence': float(confidence)
-                            }
-                            
-                            current_track_ids.add(track_id)
+                            if is_vehicle_in_zone(vehicle_bbox, zone_coords):
+                                vehicle_type = VEHICLE_CLASSES.get(cls_id_int, "UNKNOWN")
+                                
+                                tracked_vehicles_details[track_id] = {
+                                    'box': vehicle_bbox,
+                                    'type': vehicle_type,
+                                    'confidence': float(confidence)
+                                }
+                                
+                                current_track_ids.add(track_id)
 
-                # IMPROVEMENT 2: Consolidate duplicate tracks
-                merged_tracks = consolidate_duplicate_tracks(active_tracks, tracked_vehicles_details)
-                
-                # Apply merged track IDs
-                for old_id, new_id in merged_tracks.items():
-                    if old_id in tracked_vehicles_details:
-                        # Remove the duplicate from current detections
-                        del tracked_vehicles_details[old_id]
-                        if old_id in current_track_ids:
-                            current_track_ids.remove(old_id)
-                        # Mark the old track as processed to prevent saving
-                        if old_id in active_tracks:
-                            del active_tracks[old_id]
-
-                # --- 2. Plate Detection (Custom Model) ---
+                # --- 2. Plate Detection ---
                 plate_detections = []
                 plate_results = plate_model(frame, verbose=False) 
                 
@@ -853,15 +871,26 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                         active_tracks[track_id] = {
                             'vehicle_type': detail['type'],
                             'vehicle_bbox': detail['box'],
+                            'detection_score': detail['confidence'],
                             'plates': [],
                             'first_seen': frame_count,
-                            'frames_tracked': 0  # IMPROVEMENT 4: Track frame count
+                            'video_frames': deque(maxlen=int(actual_fps * VIDEO_RECORD_DURATION)),
+                            'recording': True
                         }
-                        print(f"🆕 New Track ID: {track_id} ({detail['type'].upper()})")
+                        print(f"🆕 New Track ID: {track_id} ({detail['type'].upper()}) - Started recording")
                     else:
-                        # Update vehicle bbox and increment frame count
+                        # Update vehicle bbox and score
                         active_tracks[track_id]['vehicle_bbox'] = detail['box']
-                        active_tracks[track_id]['frames_tracked'] += 1  # IMPROVEMENT 4
+                        active_tracks[track_id]['detection_score'] = detail['confidence']
+                    
+                    # Add frame to track's video buffer if still recording
+                    if active_tracks[track_id]['recording']:
+                        active_tracks[track_id]['video_frames'].append(current_frame_for_save.copy())
+                        
+                        # Stop recording after 20 seconds worth of frames
+                        if len(active_tracks[track_id]['video_frames']) >= int(actual_fps * VIDEO_RECORD_DURATION):
+                            active_tracks[track_id]['recording'] = False
+                            print(f"⏹️ Track ID {track_id}: Finished recording {VIDEO_RECORD_DURATION}s video")
                     
                     v_x1, v_y1, v_x2, v_y2 = detail['box']
                     
@@ -876,11 +905,9 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                             # Calculate Dynamic Buffer
                             plate_width = p_x2 - p_x1
                             plate_height = p_y2 - p_y1
-                            
-                            # Use 20% of the smaller dimension as buffer, min 15, max 50
                             buffer = int(max(15, min(50, min(plate_width, plate_height) * 0.2)))
                             
-                            # Perform OCR cropping using the dynamic buffer
+                            # Perform OCR cropping
                             y1_crop = max(0, p_y1 - buffer)
                             y2_crop = min(ocr_frame.shape[0], p_y2 + buffer)
                             x1_crop = max(0, p_x1 - buffer)
@@ -888,7 +915,6 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                             
                             cropped_image = ocr_frame[y1_crop:y2_crop, x1_crop:x2_crop]
                             
-                            # Original size check restriction remains
                             if cropped_image.shape[0] < 20 or cropped_image.shape[1] < 20:
                                 continue
                                 
@@ -916,17 +942,20 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                                 'frame_num': frame_count
                             })
                             
-                            break  # Only process one plate per vehicle per frame
+                            break
 
                 # --- 4. Process Tracks that have left the scene ---
                 leaving_ids = previous_track_ids - current_track_ids
                 
                 for leaving_id in leaving_ids:
                     if leaving_id in active_tracks:
-                        frames_tracked = active_tracks[leaving_id].get('frames_tracked', 0)
+                        frames_tracked = frame_count - active_tracks[leaving_id]['first_seen']
                         print(f"🚪 Track {leaving_id} leaving (tracked for {frames_tracked} frames)")
                         
                         if leaving_id not in processed_detections:
+                            # Get video frames for this track
+                            video_frames_list = list(active_tracks[leaving_id]['video_frames'])
+                            
                             process_and_save_detection(
                                 leaving_id, 
                                 active_tracks, 
@@ -934,13 +963,14 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                                 actual_fps, 
                                 actual_width, 
                                 actual_height, 
-                                list(frame_buffer),
-                                current_frame_for_save
+                                video_frames_list,
+                                current_frame_for_save,
+                                zone_coords
                             )
                         
                         del active_tracks[leaving_id]
                 
-                # Update previous tracks for next iteration
+                # Update previous tracks
                 previous_track_ids = current_track_ids.copy()
 
             except Exception as e:
