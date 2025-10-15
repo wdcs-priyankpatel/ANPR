@@ -10,6 +10,7 @@ import csv
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 import atexit
+# Assuming these imports work correctly in your environment
 from .database import SessionLocal
 from . import crud, models
 from sqlalchemy import desc
@@ -32,7 +33,8 @@ VEHICLE_CLASSES = {
 
 # Initialize global resources once per process
 try:
-    ocr = PaddleOCR(use_angle_cls=True, lang='en')
+    # Set up PaddleOCR to be quieter
+    ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
     
     # 1. Custom Plate Model (for OCR cropping)
     plate_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'best.pt')
@@ -631,7 +633,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         x_min, y_min = min(rect_start[0], rect_end[0]), min(rect_start[1], rect_end[1])
         x_max, y_max = max(rect_start[0], rect_end[0]), max(rect_start[1], rect_end[1])
         
-        buffer = 25  # Increased from 15 for better plate capture
+        # NOTE: Removed the fixed buffer variable here as it's now calculated dynamically below.
         
         print(f"🚀 Starting YOLO Tracking ANPR processing: {rtsp_link}")
         write_status(camera_id, "connecting")
@@ -749,17 +751,10 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                     p_confidences = plate_results[0].boxes.conf.cpu().numpy()
                     
                     for p_box, p_conf in zip(p_boxes, p_confidences):
-                        if p_conf > 0.3:  # Lowered from 0.5 to catch more plates
+                        if p_conf > 0.5:
                             plate_detections.append({'box': p_box.astype(int).tolist(), 'conf': float(p_conf)})
-                
-                # Debug: Log plate detections
-                if plate_detections and frame_count % 30 == 0:
-                    print(f"📸 Frame {frame_count}: Detected {len(plate_detections)} plates")
-                    for i, p_det in enumerate(plate_detections):
-                        p_x1, p_y1, p_x2, p_y2 = p_det['box']
-                        print(f"   Plate {i}: Box=({p_x1},{p_y1},{p_x2},{p_y2}), Conf={p_det['conf']:.2f}")
 
-                # --- 3. Association and OCR (IMPROVED) ---
+                # --- 3. Association and OCR ---
                 for track_id, detail in tracked_vehicles_details.items():
                     
                     # Initialize track if new
@@ -777,147 +772,58 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                     
                     v_x1, v_y1, v_x2, v_y2 = detail['box']
                     
-                    # Expand vehicle bbox for better plate matching (20% padding)
-                    v_padding_x = int((v_x2 - v_x1) * 0.2)
-                    v_padding_y = int((v_y2 - v_y1) * 0.2)
-                    v_x1_expanded = max(0, v_x1 - v_padding_x)
-                    v_y1_expanded = max(0, v_y1 - v_padding_y)
-                    v_x2_expanded = min(frame.shape[1], v_x2 + v_padding_x)
-                    v_y2_expanded = min(frame.shape[0], v_y2 + v_padding_y)
-                    
-                    plates_found_for_track = 0
-                    
-                    # Find plate within expanded vehicle bounding box
+                    # Find plate within vehicle bounding box
                     for p_det in plate_detections:
                         p_x1, p_y1, p_x2, p_y2 = p_det['box']
                         p_conf = p_det['conf']
                         
-                        # Calculate plate center
-                        p_center_x = (p_x1 + p_x2) / 2
-                        p_center_y = (p_y1 + p_y2) / 2
-                        
-                        # Check if plate center is inside expanded vehicle box (more lenient)
-                        if (v_x1_expanded <= p_center_x <= v_x2_expanded and 
-                            v_y1_expanded <= p_center_y <= v_y2_expanded):
+                        # Check if plate is inside vehicle box
+                        if p_x1 >= v_x1 and p_x2 <= v_x2 and p_y1 >= v_y1 and p_y2 <= v_y2:
                             
-                            plates_found_for_track += 1
+                            # **MODIFIED: Calculate Dynamic Buffer**
+                            plate_width = p_x2 - p_x1
+                            plate_height = p_y2 - p_y1
                             
-                            # Perform OCR with better error handling
-                            y1_crop = max(0, p_y1-buffer)
-                            y2_crop = min(ocr_frame.shape[0], p_y2+buffer)
-                            x1_crop = max(0, p_x1-buffer)
-                            x2_crop = min(ocr_frame.shape[1], p_x2+buffer)
+                            # Use 20% of the smaller dimension as buffer, min 15, max 50
+                            buffer = int(max(15, min(50, min(plate_width, plate_height) * 0.2)))
+                            
+                            # Perform OCR cropping using the dynamic buffer
+                            y1_crop = max(0, p_y1 - buffer)
+                            y2_crop = min(ocr_frame.shape[0], p_y2 + buffer)
+                            x1_crop = max(0, p_x1 - buffer)
+                            x2_crop = min(ocr_frame.shape[1], p_x2 + buffer)
                             
                             cropped_image = ocr_frame[y1_crop:y2_crop, x1_crop:x2_crop]
                             
-                            # Optional: Save debug images (uncomment to enable)
-                            # debug_dir = os.path.join(BASE_DIR, "../debug_plates")
-                            # os.makedirs(debug_dir, exist_ok=True)
-                            # cv2.imwrite(os.path.join(debug_dir, f"track_{track_id}_frame_{frame_count}.jpg"), cropped_image)
-                            
-                            # Log crop dimensions
-                            crop_h, crop_w = cropped_image.shape[:2]
-                            if frame_count % 30 == 0:
-                                print(f"🔍 Track {track_id}: Plate crop size: {crop_w}x{crop_h}")
-                            
-                            if crop_h < 20 or crop_w < 20:
-                                print(f"⚠️ Track {track_id}: Crop too small ({crop_w}x{crop_h}), skipping OCR")
+                            # Original size check restriction remains
+                            if cropped_image.shape[0] < 20 or cropped_image.shape[1] < 20:
                                 continue
-                            
-                            # Enhanced image preprocessing for better OCR
-                            try:
-                                # Try multiple preprocessing techniques
-                                gray = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
                                 
-                                # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-                                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-                                enhanced = clahe.apply(gray)
-                                
-                                # Apply bilateral filter to reduce noise while keeping edges sharp
-                                denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-                                
-                                # Apply sharpening
-                                kernel = np.array([[-1,-1,-1],
-                                                   [-1, 9,-1],
-                                                   [-1,-1,-1]])
-                                sharpened = cv2.filter2D(denoised, -1, kernel)
-                                
-                                # Convert back to BGR for PaddleOCR
-                                enhanced_bgr = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
-                                
-                                # Also try adaptive thresholding version
-                                thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                                              cv2.THRESH_BINARY, 11, 2)
-                                thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-                                
-                            except Exception as e:
-                                print(f"⚠️ Track {track_id}: Image enhancement failed: {e}")
-                                enhanced_bgr = cropped_image.copy()
-                                thresh_bgr = cropped_image.copy()
+                            ocr_result = ocr.ocr(cropped_image, cls=True)
+                            ocr_res = ""
+                            ocr_confidence = 0.0
                             
                             try:
-                                # Try OCR with multiple preprocessing methods
-                                ocr_attempts = [
-                                    ("enhanced", enhanced_bgr),
-                                    ("threshold", thresh_bgr),
-                                    ("original", cropped_image)
-                                ]
-                                
-                                best_ocr_res = ""
-                                best_ocr_confidence = 0.0
-                                best_method = "none"
-                                
-                                for method_name, img_variant in ocr_attempts:
-                                    try:
-                                        ocr_result = ocr.ocr(img_variant, cls=True)
-                                        
-                                        if ocr_result and ocr_result[0]:
-                                            temp_res = ""
-                                            temp_conf = 0.0
-                                            
-                                            for line in ocr_result[0]:
-                                                if line:
-                                                    temp_res += line[1][0] + " "
-                                                    temp_conf += line[1][1]
-                                            
-                                            if ocr_result[0]:
-                                                temp_conf /= len(ocr_result[0])
-                                            
-                                            # Keep the result with highest confidence
-                                            if temp_conf > best_ocr_confidence:
-                                                best_ocr_res = temp_res
-                                                best_ocr_confidence = temp_conf
-                                                best_method = method_name
-                                                
-                                    except Exception as e:
-                                        print(f"⚠️ Track {track_id}: OCR method '{method_name}' failed: {e}")
-                                        continue
-                                
-                                if best_ocr_res:
-                                    print(f"📝 Track {track_id}: OCR Result: '{best_ocr_res.strip()}' (confidence: {best_ocr_confidence:.2f}, method: {best_method})")
-                                else:
-                                    print(f"⚠️ Track {track_id}: All OCR methods returned no results")
-                                
-                                # Store even low confidence results - let the frequency analysis filter them
-                                if best_ocr_res or best_ocr_confidence > 0:
-                                    active_tracks[track_id]['plates'].append({
-                                        'text': best_ocr_res.replace(" ", ""),
-                                        'confidence': best_ocr_confidence,
-                                        'detection_score': p_conf,
-                                        'combined_score': (best_ocr_confidence + p_conf) / 2,
-                                        'cropped_image': cropped_image.copy(),
-                                        'frame_num': frame_count
-                                    })
-                                
+                                if ocr_result and ocr_result[0]:
+                                    for line in ocr_result[0]:
+                                        if line:
+                                            ocr_res += line[1][0] + " "
+                                            ocr_confidence += line[1][1]
+                                    if ocr_result[0]:
+                                        ocr_confidence /= len(ocr_result[0])
                             except Exception as e:
-                                print(f"❌ Track {track_id}: OCR Error: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                pass
+                            
+                            active_tracks[track_id]['plates'].append({
+                                'text': ocr_res.replace(" ", ""),
+                                'confidence': ocr_confidence,
+                                'detection_score': p_conf,
+                                'combined_score': (ocr_confidence + p_conf) / 2,
+                                'cropped_image': cropped_image.copy(),
+                                'frame_num': frame_count
+                            })
                             
                             break  # Only process one plate per vehicle per frame
-                    
-                    if plates_found_for_track == 0 and frame_count % 30 == 0:
-                        print(f"⚠️ Track {track_id}: No plates associated with vehicle this frame")
 
                 # --- 4. Process Tracks that have left the scene ---
                 leaving_ids = previous_track_ids - current_track_ids
@@ -925,7 +831,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                 for leaving_id in leaving_ids:
                     if leaving_id in active_tracks:
                         frames_tracked = frame_count - active_tracks[leaving_id]['first_seen']
-                        print(f"🚪 Track {leaving_id} leaving (tracked for {frames_tracked} frames, {len(active_tracks[leaving_id]['plates'])} plate detections)")
+                        print(f"🚪 Track {leaving_id} leaving (tracked for {frames_tracked} frames)")
                         
                         if leaving_id not in processed_detections:
                             process_and_save_detection(
