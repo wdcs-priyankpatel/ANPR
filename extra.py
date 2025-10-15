@@ -54,6 +54,9 @@ STATUS_DIR = os.path.join(BASE_DIR, "../status")
 VIDEO_FPS = 20
 BUFFER_SIZE = int(VIDEO_FPS * 30)
 
+# IMPROVEMENT 4: Minimum tracking duration
+MIN_FRAMES_TO_SAVE = 15  # Require at least 15 frames before saving
+
 os.makedirs(STATUS_DIR, exist_ok=True)
 
 # Global dictionary to track processed detections
@@ -299,6 +302,74 @@ def read_coordinates_from_string(coordinates_string):
         print(f"Error parsing coordinates: {e}. Using default coordinates.")
         return (100, 100), (300, 200)
 
+# IMPROVEMENT 2: Track consolidation functions
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two boxes"""
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Calculate intersection
+    x1_i = max(x1_1, x1_2)
+    y1_i = max(y1_1, y1_2)
+    x2_i = min(x2_1, x2_2)
+    y2_i = min(y2_1, y2_2)
+    
+    if x2_i < x1_i or y2_i < y1_i:
+        return 0.0
+    
+    intersection = (x2_i - x1_i) * (y2_i - y1_i)
+    
+    # Calculate union
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0.0
+
+def consolidate_duplicate_tracks(active_tracks, tracked_vehicles_details, iou_threshold=0.6):
+    """Merge tracks that likely represent the same vehicle"""
+    
+    track_ids = list(tracked_vehicles_details.keys())
+    merged_tracks = {}
+    
+    for i, track_id_1 in enumerate(track_ids):
+        if track_id_1 in merged_tracks:
+            continue
+            
+        box1 = tracked_vehicles_details[track_id_1]['box']
+        type1 = tracked_vehicles_details[track_id_1]['type']
+        
+        # Check against all other tracks
+        for track_id_2 in track_ids[i+1:]:
+            if track_id_2 in merged_tracks:
+                continue
+                
+            box2 = tracked_vehicles_details[track_id_2]['box']
+            type2 = tracked_vehicles_details[track_id_2]['type']
+            
+            # Only merge same vehicle types
+            if type1 != type2:
+                continue
+            
+            # Calculate IoU
+            iou = calculate_iou(box1, box2)
+            
+            if iou > iou_threshold:
+                # Merge track_id_2 into track_id_1
+                merged_tracks[track_id_2] = track_id_1
+                print(f"🔄 Merging duplicate track {track_id_2} into {track_id_1} (IoU: {iou:.2f})")
+                
+                # Merge plate data if exists
+                if track_id_2 in active_tracks and track_id_1 in active_tracks:
+                    active_tracks[track_id_1]['plates'].extend(active_tracks[track_id_2]['plates'])
+                    # Update frame count to the maximum
+                    active_tracks[track_id_1]['frames_tracked'] = max(
+                        active_tracks[track_id_1].get('frames_tracked', 0),
+                        active_tracks[track_id_2].get('frames_tracked', 0)
+                    )
+    
+    return merged_tracks
+
 def get_best_detection_for_track(ocr_results_list):
     if not ocr_results_list:
         return None
@@ -366,6 +437,12 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
         return
 
     track_data = active_tracks[track_id]
+    
+    # IMPROVEMENT 4: Check minimum tracking duration
+    frames_tracked = track_data.get('frames_tracked', 0)
+    if frames_tracked < MIN_FRAMES_TO_SAVE:
+        print(f"⏭️ Skipping track {track_id}, only tracked for {frames_tracked} frames (minimum: {MIN_FRAMES_TO_SAVE})")
+        return
     
     # 1. Get plate and vehicle data
     most_freq = get_most_frequent_text_from_best_detections(track_data['plates'])
@@ -602,7 +679,7 @@ def process_and_save_detection(track_id, active_tracks, camera_name, fps, frame_
     with open(full_json_path, 'w') as f:
         json.dump(current_data, f, indent=4)
     
-    print(f"💾 Saved detection: {log_type} (Plate: {plate_tag}, Status: {db_plate.status})")
+    print(f"💾 Saved detection: {log_type} (Plate: {plate_tag}, Status: {db_plate.status}, Tracked: {frames_tracked} frames)")
     processed_detections[track_id] = True
 
 def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, camera_id):
@@ -632,8 +709,6 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         rect_start, rect_end = read_coordinates_from_string(coordinates_string)
         x_min, y_min = min(rect_start[0], rect_end[0]), min(rect_start[1], rect_end[1])
         x_max, y_max = max(rect_start[0], rect_end[0]), max(rect_start[1], rect_end[1])
-        
-        # NOTE: Removed the fixed buffer variable here as it's now calculated dynamically below.
         
         print(f"🚀 Starting YOLO Tracking ANPR processing: {rtsp_link}")
         write_status(camera_id, "connecting")
@@ -667,14 +742,14 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         write_status(camera_id, "running")
         print(f"✅ Successfully connected to {rtsp_link}")
 
-        # Active tracks: {track_id: {'vehicle_type': str, 'vehicle_bbox': list, 'plates': []}}
+        # Active tracks: {track_id: {'vehicle_type': str, 'vehicle_bbox': list, 'plates': [], 'frames_tracked': int}}
         active_tracks = {}
         previous_track_ids = set()
         frame_count = 0
         last_stats = time.time()
         fps_start_time = time.time()
         
-        print("🎯 Using YOLOv8 Built-in Tracking (BoT-SORT)")
+        print("🎯 Using YOLOv8 Built-in Tracking (BoT-SORT) with improvements")
         
         while frame_reader.running:
             try:
@@ -707,14 +782,16 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                 
                 cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
                 
-                # --- 1. Vehicle Detection + Tracking (YOLOv8 with built-in tracker) ---
-                # Using track() instead of predict() - this enables tracking
+                # --- 1. Vehicle Detection + Tracking (IMPROVEMENT 1: Enhanced tracker config) ---
                 vehicle_results = vehicle_model.track(
                     frame, 
-                    persist=True,           # Persist tracks between frames
-                    tracker="botsort.yaml", # Options: "botsort.yaml" or "bytetrack.yaml"
+                    persist=True,
+                    tracker="botsort.yaml",
                     verbose=False,
-                    classes=list(VEHICLE_CLASSES.keys())  # Only detect vehicles
+                    classes=list(VEHICLE_CLASSES.keys()),
+                    conf=0.3,      # Lower confidence for better continuity
+                    iou=0.5,       # IoU threshold for tracking
+                    max_det=20     # Limit max detections
                 )
                 
                 tracked_vehicles_details = {}
@@ -742,6 +819,20 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                             
                             current_track_ids.add(track_id)
 
+                # IMPROVEMENT 2: Consolidate duplicate tracks
+                merged_tracks = consolidate_duplicate_tracks(active_tracks, tracked_vehicles_details)
+                
+                # Apply merged track IDs
+                for old_id, new_id in merged_tracks.items():
+                    if old_id in tracked_vehicles_details:
+                        # Remove the duplicate from current detections
+                        del tracked_vehicles_details[old_id]
+                        if old_id in current_track_ids:
+                            current_track_ids.remove(old_id)
+                        # Mark the old track as processed to prevent saving
+                        if old_id in active_tracks:
+                            del active_tracks[old_id]
+
                 # --- 2. Plate Detection (Custom Model) ---
                 plate_detections = []
                 plate_results = plate_model(frame, verbose=False) 
@@ -763,12 +854,14 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                             'vehicle_type': detail['type'],
                             'vehicle_bbox': detail['box'],
                             'plates': [],
-                            'first_seen': frame_count
+                            'first_seen': frame_count,
+                            'frames_tracked': 0  # IMPROVEMENT 4: Track frame count
                         }
                         print(f"🆕 New Track ID: {track_id} ({detail['type'].upper()})")
                     else:
-                        # Update vehicle bbox
+                        # Update vehicle bbox and increment frame count
                         active_tracks[track_id]['vehicle_bbox'] = detail['box']
+                        active_tracks[track_id]['frames_tracked'] += 1  # IMPROVEMENT 4
                     
                     v_x1, v_y1, v_x2, v_y2 = detail['box']
                     
@@ -780,7 +873,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                         # Check if plate is inside vehicle box
                         if p_x1 >= v_x1 and p_x2 <= v_x2 and p_y1 >= v_y1 and p_y2 <= v_y2:
                             
-                            # **MODIFIED: Calculate Dynamic Buffer**
+                            # Calculate Dynamic Buffer
                             plate_width = p_x2 - p_x1
                             plate_height = p_y2 - p_y1
                             
@@ -830,7 +923,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                 
                 for leaving_id in leaving_ids:
                     if leaving_id in active_tracks:
-                        frames_tracked = frame_count - active_tracks[leaving_id]['first_seen']
+                        frames_tracked = active_tracks[leaving_id].get('frames_tracked', 0)
                         print(f"🚪 Track {leaving_id} leaving (tracked for {frames_tracked} frames)")
                         
                         if leaving_id not in processed_detections:
