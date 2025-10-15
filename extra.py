@@ -631,7 +631,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
         x_min, y_min = min(rect_start[0], rect_end[0]), min(rect_start[1], rect_end[1])
         x_max, y_max = max(rect_start[0], rect_end[0]), max(rect_start[1], rect_end[1])
         
-        buffer = 15
+        buffer = 25  # Increased from 15 for better plate capture
         
         print(f"🚀 Starting YOLO Tracking ANPR processing: {rtsp_link}")
         write_status(camera_id, "connecting")
@@ -749,7 +749,7 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                     p_confidences = plate_results[0].boxes.conf.cpu().numpy()
                     
                     for p_box, p_conf in zip(p_boxes, p_confidences):
-                        if p_conf > 0.5:
+                        if p_conf > 0.3:  # Lowered from 0.5 to catch more plates
                             plate_detections.append({'box': p_box.astype(int).tolist(), 'conf': float(p_conf)})
                 
                 # Debug: Log plate detections
@@ -810,6 +810,11 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                             
                             cropped_image = ocr_frame[y1_crop:y2_crop, x1_crop:x2_crop]
                             
+                            # Optional: Save debug images (uncomment to enable)
+                            # debug_dir = os.path.join(BASE_DIR, "../debug_plates")
+                            # os.makedirs(debug_dir, exist_ok=True)
+                            # cv2.imwrite(os.path.join(debug_dir, f"track_{track_id}_frame_{frame_count}.jpg"), cropped_image)
+                            
                             # Log crop dimensions
                             crop_h, crop_w = cropped_image.shape[:2]
                             if frame_count % 30 == 0:
@@ -819,40 +824,90 @@ def anpr_worker(rtsp_link, output_json_path, coordinates_string, camera_name, ca
                                 print(f"⚠️ Track {track_id}: Crop too small ({crop_w}x{crop_h}), skipping OCR")
                                 continue
                             
-                            # Enhance image for better OCR
+                            # Enhanced image preprocessing for better OCR
                             try:
+                                # Try multiple preprocessing techniques
                                 gray = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
-                                enhanced = cv2.equalizeHist(gray)
-                                enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                                
+                                # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+                                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                                enhanced = clahe.apply(gray)
+                                
+                                # Apply bilateral filter to reduce noise while keeping edges sharp
+                                denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
+                                
+                                # Apply sharpening
+                                kernel = np.array([[-1,-1,-1],
+                                                   [-1, 9,-1],
+                                                   [-1,-1,-1]])
+                                sharpened = cv2.filter2D(denoised, -1, kernel)
+                                
+                                # Convert back to BGR for PaddleOCR
+                                enhanced_bgr = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+                                
+                                # Also try adaptive thresholding version
+                                thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                              cv2.THRESH_BINARY, 11, 2)
+                                thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+                                
                             except Exception as e:
                                 print(f"⚠️ Track {track_id}: Image enhancement failed: {e}")
                                 enhanced_bgr = cropped_image.copy()
+                                thresh_bgr = cropped_image.copy()
                             
                             try:
-                                ocr_result = ocr.ocr(enhanced_bgr, cls=True)
-                                ocr_res = ""
-                                ocr_confidence = 0.0
+                                # Try OCR with multiple preprocessing methods
+                                ocr_attempts = [
+                                    ("enhanced", enhanced_bgr),
+                                    ("threshold", thresh_bgr),
+                                    ("original", cropped_image)
+                                ]
                                 
-                                if ocr_result and ocr_result[0]:
-                                    for line in ocr_result[0]:
-                                        if line:
-                                            ocr_res += line[1][0] + " "
-                                            ocr_confidence += line[1][1]
-                                    if ocr_result[0]:
-                                        ocr_confidence /= len(ocr_result[0])
-                                    
-                                    print(f"📝 Track {track_id}: OCR Result: '{ocr_res.strip()}' (confidence: {ocr_confidence:.2f})")
+                                best_ocr_res = ""
+                                best_ocr_confidence = 0.0
+                                best_method = "none"
+                                
+                                for method_name, img_variant in ocr_attempts:
+                                    try:
+                                        ocr_result = ocr.ocr(img_variant, cls=True)
+                                        
+                                        if ocr_result and ocr_result[0]:
+                                            temp_res = ""
+                                            temp_conf = 0.0
+                                            
+                                            for line in ocr_result[0]:
+                                                if line:
+                                                    temp_res += line[1][0] + " "
+                                                    temp_conf += line[1][1]
+                                            
+                                            if ocr_result[0]:
+                                                temp_conf /= len(ocr_result[0])
+                                            
+                                            # Keep the result with highest confidence
+                                            if temp_conf > best_ocr_confidence:
+                                                best_ocr_res = temp_res
+                                                best_ocr_confidence = temp_conf
+                                                best_method = method_name
+                                                
+                                    except Exception as e:
+                                        print(f"⚠️ Track {track_id}: OCR method '{method_name}' failed: {e}")
+                                        continue
+                                
+                                if best_ocr_res:
+                                    print(f"📝 Track {track_id}: OCR Result: '{best_ocr_res.strip()}' (confidence: {best_ocr_confidence:.2f}, method: {best_method})")
                                 else:
-                                    print(f"⚠️ Track {track_id}: OCR returned no results")
+                                    print(f"⚠️ Track {track_id}: All OCR methods returned no results")
                                 
-                                active_tracks[track_id]['plates'].append({
-                                    'text': ocr_res.replace(" ", ""),
-                                    'confidence': ocr_confidence,
-                                    'detection_score': p_conf,
-                                    'combined_score': (ocr_confidence + p_conf) / 2,
-                                    'cropped_image': cropped_image.copy(),
-                                    'frame_num': frame_count
-                                })
+                                # Store even low confidence results - let the frequency analysis filter them
+                                if best_ocr_res or best_ocr_confidence > 0:
+                                    active_tracks[track_id]['plates'].append({
+                                        'text': best_ocr_res.replace(" ", ""),
+                                        'confidence': best_ocr_confidence,
+                                        'detection_score': p_conf,
+                                        'combined_score': (best_ocr_confidence + p_conf) / 2,
+                                        'cropped_image': cropped_image.copy(),
+                                        'frame_num': frame_count
+                                    })
                                 
                             except Exception as e:
                                 print(f"❌ Track {track_id}: OCR Error: {e}")
