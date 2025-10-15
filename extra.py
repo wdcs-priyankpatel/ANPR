@@ -41,7 +41,7 @@ try:
     plate_model = YOLO(plate_model_path, task="detect")
     
     # 2. General Vehicle Model with TRACKING enabled (YOLOv8n)
-    vehicle_model = YOLO('yolov8n.pt')
+    vehicle_model = YOLO('yolov8s.pt')
     
 except Exception as e:
     print(f"Error initializing models in anpr_worker: {e}")
